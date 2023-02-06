@@ -69,9 +69,17 @@ class PairwiseDataset(Dataset):
 class DataCollatorReward:
     def __call__(self, data):
         batch = {}
-        batch["input_ids"] = torch.cat([f[0] for f in data] + [f[2] for f in data])
-        batch["attention_mask"] = torch.cat([f[1] for f in data] + [f[3] for f in data])
-        batch["labels"] = torch.tensor([0] * len(data) + [1] * len(data))
+        batch["input_ids"] = torch.cat(sum([[x[k] for k in range(len(x)) if k % 2 == 0] for x in data], []))
+        batch["attention_mask"] = torch.cat(sum([[x[k] for k in range(len(x)) if k % 2 == 1] for x in data], []))
+        batch["labels"] = torch.tensor(sum([[i] * len(data) for i in range(len(data))], []))
+
+        batch2 = {}
+        batch2["input_ids"] = torch.cat([f[0] for f in data] + [f[2] for f in data])
+        batch2["attention_mask"] = torch.cat([f[1] for f in data] + [f[3] for f in data])
+        batch2["labels"] = torch.tensor([0] * len(data) + [1] * len(data))
+
+        assert batch == batch2
+
         return batch
 
 
