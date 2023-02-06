@@ -7,62 +7,63 @@ from torch.utils.data import Dataset
 from tqdm import tqdm
 from transformers import AutoTokenizer, Trainer, TrainingArguments
 
-
-def create_comparison_dataset(path="CarperAI/openai_summarize_comparisons", split="train"):
-    dataset = load_dataset(path, split=split)
-    pairs = []
+def remap_chosen_rejected_to_ranking(dataset):
+    result = []
     for sample in tqdm(dataset):
-        pair = {}
-        prompt = sample["prompt"]
-        chosen_summary = sample["chosen"]
-        rejected_summary = sample["rejected"]
-        if chosen_summary == rejected_summary:
-            continue
-        if len(chosen_summary.split()) < 5 or len(rejected_summary.split()) < 5:
-            continue
-        pair["chosen"] = prompt + "\n" + chosen_summary
-        pair["rejected"] = prompt + "\n" + rejected_summary
-        pairs.append(pair)
-    return pairs
+        result.append({
+            "prompt": sample["prompt"],
+            "ranked_outputs": [
+                sample["chosen"],
+                sample["rejected"]
+            ]
+        })
+    return result
+
+
+def remove_duplicates(xs):
+    # keys are inserted in order, so only the first occurrence of each element in each list is preserved
+    return list(dict.fromkeys(xs))
+
+
+def is_too_short(output):
+    return len(output.split()) < 5
+
+
+def create_comparison_dataset(dataset):
+    result = []
+    for sample in tqdm(dataset):
+        ranked_outputs = remove_duplicates([
+            f"{sample['prompt']}\n{output}"
+            for output in sample["ranked_outputs"]
+            if not is_too_short(output)]
+        )
+        if len(ranked_outputs) >= 2:
+            result.append(ranked_outputs)
+    return result
 
 
 class PairwiseDataset(Dataset):
-    def __init__(self, pairs, tokenizer, max_length):
-        self.chosen_input_ids = []
-        self.chosen_attn_masks = []
-        self.rejected_input_ids = []
-        self.rejected_attn_masks = []
-        for pair in tqdm(pairs):
-            chosen, rejected = pair["chosen"], pair["rejected"]
-            chosen_encodings_dict = tokenizer(
-                "<|startoftext|>" + chosen + "<|endoftext|>",
-                truncation=True,
-                max_length=max_length,
-                padding="max_length",
-                return_tensors="pt",
-            )
-            rejected_encodings_dict = tokenizer(
-                "<|startoftext|>" + rejected + "<|endoftext|>",
-                truncation=True,
-                max_length=max_length,
-                padding="max_length",
-                return_tensors="pt",
-            )
-            self.chosen_input_ids.append(chosen_encodings_dict["input_ids"])
-            self.chosen_attn_masks.append(chosen_encodings_dict["attention_mask"])
-            self.rejected_input_ids.append(rejected_encodings_dict["input_ids"])
-            self.rejected_attn_masks.append(rejected_encodings_dict["attention_mask"])
+    def __init__(self, rankings, tokenizer, max_length):
+        self.items = []
+        for ranking in tqdm(rankings):
+            current_items = []
+            for output in ranking:
+                encodings_dict = tokenizer(
+                    "<|startoftext|>" + output + "<|endoftext|>",
+                    truncation=True,
+                    max_length=max_length,
+                    padding="max_length",
+                    return_tensors="pt",
+                )
+                current_items.append(encodings_dict["input_ids"])
+                current_items.append(encodings_dict["attention_mask"])
+            self.items.append(current_items)
 
     def __len__(self):
-        return len(self.chosen_input_ids)
+        return len(self.items)
 
     def __getitem__(self, idx):
-        return (
-            self.chosen_input_ids[idx],
-            self.chosen_attn_masks[idx],
-            self.rejected_input_ids[idx],
-            self.rejected_attn_masks[idx],
-        )
+        return self.items[idx]
 
 
 class DataCollatorReward:
@@ -113,6 +114,20 @@ if __name__ == "__main__":
         save_total_limit=1,
     )
 
+    # Create the comparisons datasets
+    data_path = "CarperAI/openai_summarize_comparisons"
+    dataset = load_dataset(data_path)
+    train_pairs = create_comparison_dataset(remap_chosen_rejected_to_ranking(dataset["train"]))
+    val_pairs = create_comparison_dataset(remap_chosen_rejected_to_ranking(dataset["test"]))
+
+    # Make pairwise datasets for training
+    max_length = 550
+    train_dataset = PairwiseDataset(train_pairs, tokenizer, max_length=max_length)
+    val_dataset = PairwiseDataset(val_pairs, tokenizer, max_length=max_length)
+
+    # Create the collator to gather batches of pairwise comparisons
+    data_collator = DataCollatorReward()
+
     # Initialize the reward model from the (supervised) fine-tuned GPT-J
     model = GPTRewardModel("CarperAI/openai_summarize_tldr_sft")
 
@@ -122,19 +137,6 @@ if __name__ == "__main__":
     num_unfrozen = int(0.3 * num_layers)
     for layer in layers[:-num_unfrozen]:
         layer.requires_grad_(False)
-
-    # Create the comparisons datasets
-    data_path = "CarperAI/openai_summarize_comparisons"
-    train_pairs = create_comparison_dataset(data_path, "train")
-    val_pairs = create_comparison_dataset(data_path, "test")
-
-    # Make pairwise datasets for training
-    max_length = 550
-    train_dataset = PairwiseDataset(train_pairs, tokenizer, max_length=max_length)
-    val_dataset = PairwiseDataset(val_pairs, tokenizer, max_length=max_length)
-
-    # Create the collator to gather batches of pairwise comparisons
-    data_collator = DataCollatorReward()
 
     Trainer(
         model=model,
